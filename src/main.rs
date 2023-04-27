@@ -1,19 +1,40 @@
 use bevy::{prelude::*, render::camera::ScalingMode};
+use bevy_ggrs::*;
+use bevy_matchbox::prelude::*;
+
+#[derive(Component)]
+struct Player {
+    handle: usize,
+}
+
+struct GgrsConfig;
+
+impl ggrs::Config for GgrsConfig {
+    type Input = u8;
+    type State = u8;
+    type Address = PeerId;
+}
 
 fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                fit_canvas_to_parent: true,
-                prevent_default_event_handling: false,
-                ..default()
-            }),
+    let mut app = App::new();
+
+    GGRSPlugin::<GgrsConfig>::new()
+        .with_input_system(input)
+        // .register_rollback_resource::<Transform>()
+        .build(&mut app);
+
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            fit_canvas_to_parent: true,
+            prevent_default_event_handling: false,
             ..default()
-        }))
-        .insert_resource(ClearColor(Color::rgb(0.47, 0.47, 0.47)))
-        .add_startup_systems((setup, spawn_player))
-        .add_system(move_player)
-        .run();
+        }),
+        ..default()
+    }))
+    .insert_resource(ClearColor(Color::rgb(0.47, 0.47, 0.47)))
+    .add_startup_systems((setup, spawn_players, start_matchbox_socket))
+    .add_systems((move_players.in_schedule(GGRSSchedule), wait_for_players))
+    .run();
 }
 
 fn setup(mut commands: Commands) {
@@ -22,8 +43,9 @@ fn setup(mut commands: Commands) {
     commands.spawn(camera_bundle);
 }
 
-fn spawn_player(mut commands: Commands) {
-    let sprite_bundle = SpriteBundle {
+fn spawn_players(mut commands: Commands, mut rip: ResMut<RollbackIdProvider>) {
+    let sprite_bundle1 = SpriteBundle {
+        transform: Transform::from_translation(Vec3::new(-2., 0., 0.)),
         sprite: Sprite {
             color: Color::rgb(0.0, 0.53, 1.0),
             custom_size: Some(Vec2::new(1., 1.)),
@@ -31,31 +53,114 @@ fn spawn_player(mut commands: Commands) {
         },
         ..default()
     };
-    commands.spawn((Player, sprite_bundle));
+    let sprite_bundle2 = SpriteBundle {
+        transform: Transform::from_translation(Vec3::new(2., 0., 0.)),
+        sprite: Sprite {
+            color: Color::rgb(0.0, 1.0, 0.53),
+            custom_size: Some(Vec2::new(1., 1.)),
+            ..default()
+        },
+        ..default()
+    };
+    commands.spawn((Player { handle: 0 }, rip.next(), sprite_bundle1));
+    commands.spawn((Player { handle: 1 }, rip.next(), sprite_bundle2));
 }
 
-fn move_player(keys: Res<Input<KeyCode>>, mut player_query: Query<&mut Transform, With<Player>>) {
-    let mut direction = Vec2::ZERO;
-    if keys.any_pressed([KeyCode::Up, KeyCode::W]) {
-        direction.y += 1.;
-    }
-    if keys.any_pressed([KeyCode::Down, KeyCode::S]) {
-        direction.y -= 1.;
-    }
-    if keys.any_pressed([KeyCode::Left, KeyCode::A]) {
-        direction.x -= 1.;
-    }
-    if keys.any_pressed([KeyCode::Right, KeyCode::D]) {
-        direction.x += 1.;
-    }
+fn move_players(
+    inputs: Res<PlayerInputs<GgrsConfig>>,
+    mut player_query: Query<(&mut Transform, &Player)>,
+) {
+    for (mut transform, player) in player_query.iter_mut() {
+        let mut direction = Vec2::ZERO;
 
-    let move_speed = 0.13;
-    let move_delta = (direction * move_speed).extend(0.);
+        let (input, _) = inputs[player.handle];
 
-    for mut transform in player_query.iter_mut() {
+        if input & INPUT_UP != 0 {
+            direction.y += 1.;
+        }
+        if input & INPUT_DOWN != 0 {
+            direction.y -= 1.;
+        }
+        if input & INPUT_RIGHT != 0 {
+            direction.x += 1.;
+        }
+        if input & INPUT_LEFT != 0 {
+            direction.x -= 1.;
+        }
+        if direction == Vec2::ZERO {
+            continue;
+        }
+
+        let move_speed = 0.13;
+        let move_delta = (direction * move_speed).extend(0.);
+
         transform.translation += move_delta;
     }
 }
 
-#[derive(Component)]
-struct Player;
+fn input(_: In<ggrs::PlayerHandle>, keys: Res<Input<KeyCode>>) -> u8 {
+    let mut input = 0u8;
+
+    if keys.any_pressed([KeyCode::Up, KeyCode::W]) {
+        input |= INPUT_UP;
+    }
+    if keys.any_pressed([KeyCode::Down, KeyCode::S]) {
+        input |= INPUT_DOWN;
+    }
+    if keys.any_pressed([KeyCode::Left, KeyCode::A]) {
+        input |= INPUT_LEFT;
+    }
+    if keys.any_pressed([KeyCode::Right, KeyCode::D]) {
+        input |= INPUT_RIGHT;
+    }
+    if keys.any_pressed([KeyCode::Space]) {
+        input |= INPUT_FIRE;
+    }
+
+    input
+}
+
+fn start_matchbox_socket(mut commands: Commands) {
+    let room_url = "ws://127.0.0.1:3536/extreme?next=2";
+    info!("connecting to server: {:?}", room_url);
+    commands.insert_resource(MatchboxSocket::new_ggrs(room_url));
+}
+
+fn wait_for_players(mut commands: Commands, mut socket: ResMut<MatchboxSocket<SingleChannel>>) {
+    socket.update_peers();
+    let players = socket.players();
+    let num_players = 2;
+
+    if players.len() < num_players {
+        return;
+    }
+
+    info!("Errybodies here!");
+
+    let mut session_builder = ggrs::SessionBuilder::<GgrsConfig>::new()
+        .with_num_players(num_players)
+        .with_input_delay(2);
+
+    for (i, player) in players.into_iter().enumerate() {
+        session_builder = session_builder
+            .add_player(player, i)
+            .expect("failed to add");
+    }
+
+    if let Ok(channel) = socket.take_channel(0) {
+        info!("Channeled");
+        let ggrs_session = session_builder
+            .start_p2p_session(channel)
+            .expect("failed to start channel");
+
+        commands.insert_resource(bevy_ggrs::Session::P2PSession(ggrs_session));
+    } else {
+        info!("Not channeled :(");
+    }
+}
+
+const INPUT_UP: u8 = 1 << 0;
+const INPUT_DOWN: u8 = 1 << 1;
+const INPUT_LEFT: u8 = 1 << 2;
+const INPUT_RIGHT: u8 = 1 << 3;
+const INPUT_FIRE: u8 = 1 << 4;
